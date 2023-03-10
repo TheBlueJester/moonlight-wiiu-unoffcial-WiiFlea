@@ -31,7 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
-#include "uuid.h"
+#include <uuid/uuid.h>
 #include <openssl/sha.h>
 #include <openssl/aes.h>
 #include <openssl/rand.h>
@@ -94,16 +94,16 @@ static int load_unique_id(const char* keyDirectory) {
   snprintf(uniqueFilePath, PATH_MAX, "%s/%s", keyDirectory, UNIQUE_FILE_NAME);
 
   FILE *fd = fopen(uniqueFilePath, "r");
-  if (fd == NULL) {
+  if (fd == NULL || fread(unique_id, UNIQUEID_CHARS, 1, fd) != UNIQUEID_CHARS) {
     snprintf(unique_id,UNIQUEID_CHARS+1,"0123456789ABCDEF");
 
+    if (fd)
+      fclose(fd);
     fd = fopen(uniqueFilePath, "w");
     if (fd == NULL)
       return GS_FAILED;
 
     fwrite(unique_id, UNIQUEID_CHARS, 1, fd);
-  } else {
-    fread(unique_id, UNIQUEID_CHARS, 1, fd);
   }
   fclose(fd);
   unique_id[UNIQUEID_CHARS] = 0;
@@ -237,6 +237,7 @@ static int load_serverinfo(PSERVER_DATA server, bool https) {
   server->currentGame = currentGameText == NULL ? 0 : atoi(currentGameText);
   server->supports4K = serverCodecModeSupportText != NULL;
   server->serverMajorVersion = atoi(server->serverInfo.serverInfoAppVersion);
+  server->isNvidiaSoftware = strstr(stateText, "MJOLNIR") != NULL;
 
   server->httpsPort = atoi(httpsPortText);
   if (!server->httpsPort)
@@ -418,39 +419,15 @@ int gs_unpair(PSERVER_DATA server) {
   return ret;
 }
 
-#ifdef __WIIU__
-// Wii U doesn't like the %2hhx formatting so this is a quick and dirty hexstring converter
-// https://stackoverflow.com/a/53579348/11511475
-static void hex2bin(const char* in, size_t len, unsigned char* out) {
-  static const unsigned char TBL[] = {
-     0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  58,  59,  60,  61,
-    62,  63,  64,  10,  11,  12,  13,  14,  15,  71,  72,  73,  74,  75,
-    76,  77,  78,  79,  80,  81,  82,  83,  84,  85,  86,  87,  88,  89,
-    90,  91,  92,  93,  94,  95,  96,  10,  11,  12,  13,  14,  15
-  };
-
-  static const unsigned char *LOOKUP = TBL - 48;
-
-  const char* end = in + len;
-
-  while(in < end) *(out++) = LOOKUP[*(in++)] << 4 | LOOKUP[*(in++)];
-}
-#endif
-
 int gs_pair(PSERVER_DATA server, char* pin) {
   int ret = GS_OK;
   char* result = NULL;
-  char url[4096];
+  char url[5120];
   uuid_t uuid;
   char uuid_str[UUID_STRLEN];
 
   if (server->paired) {
     gs_error = "Already paired";
-    return GS_WRONG_STATE;
-  }
-
-  if (server->currentGame != 0) {
-    gs_error = "The computer is currently in a game.\nYou must close the game before pairing";
     return GS_WRONG_STATE;
   }
 
@@ -492,13 +469,9 @@ int gs_pair(PSERVER_DATA server, char* pin) {
     goto cleanup;
   }
 
-#ifndef __WIIU__
   for (int count = 0; count < strlen(result); count += 2) {
     sscanf(&result[count], "%2hhx", &plaincert[count / 2]);
   }
-#else
-  hex2bin(result, strlen(result), plaincert);
-#endif
   plaincert[strlen(result)/2] = '\0';
 
   unsigned char salt_pin[sizeof(salt_data) + 4];
@@ -554,13 +527,9 @@ int gs_pair(PSERVER_DATA server, char* pin) {
     goto cleanup;
   }
 
-#ifndef __WIIU__
   for (int count = 0; count < strlen(result); count += 2) {
     sscanf(&result[count], "%2hhx", &challenge_response_data_enc[count / 2]);
   }
-#else
-  hex2bin(result, strlen(result), challenge_response_data_enc);
-#endif
 
   decrypt(challenge_response_data_enc, sizeof(challenge_response_data_enc), aes_key, challenge_response_data);
 
@@ -619,13 +588,9 @@ int gs_pair(PSERVER_DATA server, char* pin) {
     goto cleanup;
   }
 
-#ifndef __WIIU__
   for (int count = 0; count < strlen(result); count += 2) {
     sscanf(&result[count], "%2hhx", &pairing_secret[count / 2]);
   }
-#else
-  hex2bin(result, strlen(result), pairing_secret);
-#endif
 
   if (!verifySignature(pairing_secret, 16, pairing_secret+16, SIGNATURE_LEN, plaincert)) {
     gs_error = "MITM attack detected";
@@ -696,6 +661,13 @@ int gs_pair(PSERVER_DATA server, char* pin) {
 
   http_free_data(data);
 
+  // If we failed when attempting to pair with a game running, that's likely the issue.
+  // Sunshine supports pairing with an active session, but GFE does not.
+  if (ret != GS_OK && server->currentGame != 0) {
+    gs_error = "The computer is currently in a game. You must close the game before pairing.";
+    ret = GS_WRONG_STATE;
+  }
+
   return ret;
 }
 
@@ -730,10 +702,8 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION *config, int appId, b
 
   PDISPLAY_MODE mode = server->modes;
   bool correct_mode = false;
-  bool supported_resolution = false;
   while (mode != NULL) {
     if (mode->width == config->width && mode->height == config->height) {
-      supported_resolution = true;
       if (mode->refresh == config->fps)
         correct_mode = true;
     }
@@ -762,19 +732,18 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION *config, int appId, b
   if (data == NULL)
     return GS_OUT_OF_MEMORY;
 
+  // Using an FPS value over 60 causes SOPS to default to 720p60,
+  // so force it to 0 to ensure the correct resolution is set. We
+  // used to use 60 here but that locked the frame rate to 60 FPS
+  // on GFE 3.20.3.
+  int fps = (server->isNvidiaSoftware && config->fps > 60) ? 0 : config->fps;
+
   uuid_generate_random(uuid);
   uuid_unparse(uuid, uuid_str);
   int surround_info = SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(config->audioConfiguration);
-  if (server->currentGame == 0) {
-    // Using an FPS value over 60 causes SOPS to default to 720p60,
-    // so force it to 0 to ensure the correct resolution is set. We
-    // used to use 60 here but that locked the frame rate to 60 FPS
-    // on GFE 3.20.3.
-    int fps = config->fps > 60 ? 0 : config->fps;
-    snprintf(url, sizeof(url), "https://%s:%u/launch?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d&additionalStates=1&sops=%d&rikey=%s&rikeyid=%d&localAudioPlayMode=%d&surroundAudioInfo=%d&remoteControllersBitmap=%d&gcmap=%d", server->serverInfo.address, server->httpsPort, unique_id, uuid_str, appId, config->width, config->height, fps, sops, rikey_hex, rikeyid, localaudio, surround_info, gamepad_mask, gamepad_mask);
-  } else
-    snprintf(url, sizeof(url), "https://%s:%u/resume?uniqueid=%s&uuid=%s&rikey=%s&rikeyid=%d&surroundAudioInfo=%d", server->serverInfo.address, server->httpsPort, unique_id, uuid_str, rikey_hex, rikeyid, surround_info);
-
+  snprintf(url, sizeof(url), "https://%s:%u/%s?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d&additionalStates=1&sops=%d&rikey=%s&rikeyid=%d&localAudioPlayMode=%d&surroundAudioInfo=%d&remoteControllersBitmap=%d&gcmap=%d%s",
+           server->serverInfo.address, server->httpsPort, server->currentGame ? "resume" : "launch", unique_id, uuid_str, appId, config->width, config->height, fps, sops, rikey_hex, rikeyid, localaudio, surround_info, gamepad_mask, gamepad_mask,
+           config->enableHdr ? "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" : "");
   if ((ret = http_request(url, data)) == GS_OK)
     server->currentGame = appId;
   else
@@ -782,7 +751,8 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION *config, int appId, b
 
   if ((ret = xml_status(data->memory, data->size) != GS_OK))
     goto cleanup;
-  else if ((ret = xml_search(data->memory, data->size, "gamesession", &result)) != GS_OK)
+  else if ((ret = xml_search(data->memory, data->size, "gamesession", &result)) != GS_OK &&
+           (ret = xml_search(data->memory, data->size, "resume", &result)) != GS_OK)
     goto cleanup;
 
   if (!strcmp(result, "0")) {
@@ -841,12 +811,7 @@ int gs_quit_app(PSERVER_DATA server) {
 }
 
 int gs_init(PSERVER_DATA server, char *address, unsigned short httpPort, const char *keyDirectory, int log_level, bool unsupported) {
-#ifndef __WIIU__
   mkdirtree(keyDirectory);
-#else
-  // the above will fail on the Wii U due to the /vol/external01
-  mkdir(keyDirectory, 0775);
-#endif
   if (load_unique_id(keyDirectory) != GS_OK)
     return GS_FAILED;
 
