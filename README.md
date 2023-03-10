@@ -1,4 +1,5 @@
-# Moonlight Wii U
+# Moonlight Wii U - Unofficial
+## Not from original author
 
 Moonlight Wii U is a port of Moonlight Embedded, which is an open source implementation of NVIDIA's GameStream, as used by the NVIDIA Shield.
 
