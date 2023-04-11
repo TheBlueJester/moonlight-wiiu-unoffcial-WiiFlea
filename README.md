@@ -37,15 +37,3 @@ You can configure all of the documented settings in the `moonlight.conf` file lo
 ## See also
 
 [Moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c) is the shared codebase between different Moonlight implementations
-
-## Contribute
-
-1. Fork us
-2. Write code
-3. Send Pull Requests
-
-## Building from source
-
-You can simply build this using the provided Dockerfile.  
-Use `docker build -t moonlightbuilder .` to build the container.  
-Then use `docker run -it --rm -v ${PWD}:/project moonlightbuilder make` to build moonlight.  
